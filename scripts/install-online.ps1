@@ -6,7 +6,7 @@
 .DESCRIPTION
     一行命令（在 PowerShell 中粘贴执行，经 wget.la 镜像获取本脚本）：
 
-      [Net.ServicePointManager]::SecurityProtocol=3072; & ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('https://wget.la/https://raw.githubusercontent.com/yuaotian/antigravity-proxy/main/scripts/install-online.ps1')))
+      [Net.ServicePointManager]::SecurityProtocol=3072; & ([scriptblock]::Create((New-Object Net.WebClient).DownloadString('https://wget.la/https://raw.githubusercontent.com/SunnyYYLin/antigravity-proxy/main/scripts/install-online.ps1')))
 
     需要传参时把参数加在末尾，例如 ... install-online.ps1'))) -Product ide -Version 2.5
 
@@ -67,7 +67,7 @@ $ErrorActionPreference = "Stop"
 $script:RunAsFile = [bool]$MyInvocation.MyCommand.Path
 $script:ExitCode = 0
 
-$script:Repo = "yuaotian/antigravity-proxy"
+$script:Repo = "SunnyYYLin/antigravity-proxy"
 $script:Root = Join-Path $env:LOCALAPPDATA "antigravity-proxy"
 # GitHub 代理站（镜像），与 DLL 更新检查 updates.mirrors 默认值一致；路线顺序见 Get-Routes。
 # 实测（2026-11）：wget.la 可转发 api.github.com 与 Release 下载；fastgit.cc / boki / ednovas 只能下载 Release
