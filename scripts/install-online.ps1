@@ -120,6 +120,8 @@ $script:Msg = @{
     ArchSkip        = @("{0} 是 {1} 程序，暂无对应补丁，已跳过。", "{0} is a {1} binary; no matching build, skipped.", "{0} — сборка {1}, подходящего патча нет, пропущено.")
     AssetMissing    = @("{0} 未提供资产 {1}（该版本可能尚未支持此架构，请使用更新的版本）。", "{0} does not include asset {1} (this release may not support this architecture yet; try a newer version).", "В {0} отсутствует файл {1} (возможно, этот релиз ещё не поддерживает данную архитектуру; попробуйте более новую версию).")
     ResolvingTag    = @("获取最新版本...", "Fetching latest version...", "Получение последней версии...")
+    TagApiFallback  = @("GitHub API 受限或不可达，尝试通过 releases 跳转获取最新版本...", "GitHub API rate-limited or unreachable; falling back to releases redirect...", "GitHub API ограничен или недоступен; пробую получить версию через редирект...")
+    TagFallbackOk   = @("  已通过网页跳转解析最新版本：{0}（来源：{1}）", "  Resolved latest version via redirect: {0} (from {1})", "  Версия определена через редирект: {0} (источник: {1})")
     TagFailed       = @("无法获取最新版本（GitHub 与镜像均不可达）。请检查网络或代理，或用 -Version 指定版本。",
                         "Cannot fetch the latest version (GitHub and mirrors unreachable). Check your network/proxy, or pass -Version.",
                         "Не удалось получить последнюю версию (GitHub и зеркала недоступны). Проверьте сеть/прокси или укажите -Version.")
@@ -304,7 +306,7 @@ function Get-Routes {
 # 依次尝试各路线，每条路线最多 MaxAttemptsPerSource 次（超时、断流、5xx、内容不合格都会重试；
 # 4xx 说明该源不支持此地址，直接换源）。Validate 返回非空字符串表示内容不合格（错误页 / 哈希不符，
 # 镜像断流截断也会表现为哈希不符）。成功的路线提到最前，后续下载优先复用；全部失败时输出汇总并返回 $null
-function Invoke-Sources([string]$Target, [scriptblock]$Validate, $State = $null) {
+function Invoke-Sources([string]$Target, [scriptblock]$Validate, $State = $null, [switch]$QuietOnFail) {
     $routes = Get-Routes
     if ($script:PreferredRoute) {
         $routes = @($routes | Where-Object { $_.Label -eq $script:PreferredRoute }) + @($routes | Where-Object { $_.Label -ne $script:PreferredRoute })
@@ -334,7 +336,7 @@ function Invoke-Sources([string]$Target, [scriptblock]$Validate, $State = $null)
             }
         }
     }
-    Write-Err ((T "AllRoutesFailed") -f @($routes).Count, $script:MaxAttemptsPerSource)
+    if (-not $QuietOnFail) { Write-Err ((T "AllRoutesFailed") -f @($routes).Count, $script:MaxAttemptsPerSource) }
     return $null
 }
 
@@ -342,6 +344,66 @@ function Get-Sha256Hex([byte[]]$Bytes) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "") }
     finally { $sha.Dispose() }
+}
+
+# 当 GitHub REST API 触发未认证 403/429 限流或镜像不支持 API 时，改用 /releases/latest 网页跳转解析版本 tag（无 60次/小时 API 限制）
+function Resolve-LatestTagWeb {
+    $webUrl = "https://github.com/$($script:Repo)/releases/latest"
+    $repoEscaped = [regex]::Escape($script:Repo)
+    $tagPattern = "/$repoEscaped/releases/tag/(v\d+\.\d+(?:\.\d+)?)(?:[`"'\s/?#]|`$)"
+    $injected = -not [string]::IsNullOrWhiteSpace($InjectedProxy)
+
+    $webRoutes = @()
+    if ($injected) {
+        $webRoutes += [pscustomobject]@{ Prefix = ""; Proxy = $null; Label = $script:WebProxyLabel }
+    } elseif ($script:WebProxy) {
+        $webRoutes += [pscustomobject]@{ Prefix = ""; Proxy = $script:WebProxy; Label = $script:WebProxyLabel }
+        $webRoutes += [pscustomobject]@{ Prefix = ""; Proxy = $null; Label = (T "Direct") }
+    } else {
+        $webRoutes += [pscustomobject]@{ Prefix = ""; Proxy = $null; Label = (T "Direct") }
+    }
+    foreach ($m in $script:Mirrors) {
+        $webRoutes += [pscustomobject]@{ Prefix = $m; Proxy = $null; Label = ([Uri]$m).Host }
+    }
+
+    foreach ($r in $webRoutes) {
+        try {
+            $req = [Net.WebRequest]::Create($r.Prefix + $webUrl)
+            $req.Timeout = $script:RequestTimeoutMs
+            $req.ReadWriteTimeout = $script:RequestTimeoutMs
+            $req.UserAgent = "antigravity-proxy-online-installer"
+            $req.Proxy = $r.Proxy
+            if ($req -is [Net.HttpWebRequest]) { $req.AllowAutoRedirect = $false }
+            $resp = $req.GetResponse()
+            try {
+                $loc = [string]$resp.Headers["Location"]
+                if ($loc -match $tagPattern) {
+                    $script:PreferredRoute = $r.Label
+                    Write-Dim ((T "TagFallbackOk") -f $Matches[1], $r.Label)
+                    return $Matches[1]
+                }
+                if ($resp.ResponseUri -and ([string]$resp.ResponseUri.AbsolutePath) -match $tagPattern) {
+                    $script:PreferredRoute = $r.Label
+                    Write-Dim ((T "TagFallbackOk") -f $Matches[1], $r.Label)
+                    return $Matches[1]
+                }
+                if ([int]$resp.StatusCode -eq 200) {
+                    $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
+                    $html = $sr.ReadToEnd()
+                    if ($html -match $tagPattern) {
+                        $script:PreferredRoute = $r.Label
+                        Write-Dim ((T "TagFallbackOk") -f $Matches[1], $r.Label)
+                        return $Matches[1]
+                    }
+                }
+            } finally {
+                $resp.Close()
+            }
+        } catch {
+            Write-Dim ((T "SourceFailed") -f $r.Label, 1, 1, (Get-InnerMessage $_))
+        }
+    }
+    return ""
 }
 
 function Resolve-ReleaseTag {
@@ -354,7 +416,7 @@ function Resolve-ReleaseTag {
         return "v$v"
     }
     Write-Info (T "ResolvingTag")
-    $result = Invoke-Sources -Target "https://api.github.com/repos/$($script:Repo)/releases/latest" -Validate {
+    $result = Invoke-Sources -Target "https://api.github.com/repos/$($script:Repo)/releases/latest" -QuietOnFail -Validate {
         param($b)
         try {
             $json = [Text.Encoding]::UTF8.GetString($b) | ConvertFrom-Json
@@ -362,14 +424,22 @@ function Resolve-ReleaseTag {
         } catch { }
         return "no tag_name"
     }
-    if (-not $result) {
-        Write-Err (T "TagFailed")
-        return ""
+    if ($result) {
+        $release = [Text.Encoding]::UTF8.GetString($result.Bytes) | ConvertFrom-Json
+        # 记下资产清单：没有 SHA256SUMS.txt 的旧版本直接跳过校验，不必逐个源试探
+        $script:ReleaseAssets = @($release.assets | ForEach-Object { [string]$_.name })
+        return [string]$release.tag_name
     }
-    $release = [Text.Encoding]::UTF8.GetString($result.Bytes) | ConvertFrom-Json
-    # 记下资产清单：没有 SHA256SUMS.txt 的旧版本直接跳过校验，不必逐个源试探
-    $script:ReleaseAssets = @($release.assets | ForEach-Object { [string]$_.name })
-    return [string]$release.tag_name
+
+    Write-Warn (T "TagApiFallback")
+    $fallbackTag = Resolve-LatestTagWeb
+    if ($fallbackTag) {
+        $script:ReleaseAssets = @()
+        return $fallbackTag
+    }
+
+    Write-Err (T "TagFailed")
+    return ""
 }
 
 # 校验清单（v2.5 起随 Release 发布）：取不到只告警不阻断；取到后逐个资产比对，不一致则换源
