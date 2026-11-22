@@ -64,7 +64,7 @@ jobs:
         }
 
         $expectedMachine = switch ($arch) { "x64" { 0x8664 } "x86" { 0x014C } "arm64" { 0xAA64 } }
-        foreach ($bin in @("output\ide\version.dll", "output\cli\dbghelp.dll", "output\cli\antigravity_proxy.dll", "output\launcher\AntigravityLauncher.exe")) {
+        foreach ($bin in @("output\ide\version.dll", "output\cli\dbghelp.dll", "output\cli\antigravity_proxy.dll", "output\cli\agy-acp-proxy.exe", "output\launcher\AntigravityLauncher.exe")) {
           $fs = [IO.File]::OpenRead($bin)
           try {
             $br = New-Object IO.BinaryReader($fs)

@@ -438,6 +438,30 @@ function Get-PatchFileNames {
     return @("version.dll")
 }
 
+# 可选补丁文件（Issue #164）：母本里有就一并部署/恢复，没有也不算失败。
+# agy-acp-proxy.exe 只在其它编辑器经 ACP 启动 Agent 时使用；旧版发布包不含它，不能列为必需文件。
+function Get-OptionalPatchFileNames {
+    param([string]$Variant)
+    if ($Variant -eq "cli") { return @("agy-acp-proxy.exe") }
+    return @()
+}
+
+function Copy-OptionalPatchFiles {
+    param([string]$SrcDir, [string]$BaseDir, [string]$Variant)
+    foreach ($file in (Get-OptionalPatchFileNames $Variant)) {
+        if (-not (Test-FileExists (Join-Path $SrcDir $file))) { continue }
+        try {
+            $path = Copy-PatchFile -SrcDir $SrcDir -BaseDir $BaseDir -FileName $file
+            Add-Finding -Level "Pass" -Code "OptionalPatchDeployed" -Message ("已部署可选文件 {0}" -f $path)
+        } catch {
+            # 可选文件失败只告警：不影响 agy.exe 本身的代理补丁
+            Add-Finding -Level "Warn" -Code "OptionalPatchFailed" `
+                -Message ("部署可选文件 {0} 失败: {1}" -f $file, $_.Exception.Message) `
+                -Hint "该文件仅供其它编辑器经 ACP 启动 Agent 时使用；被占用时请先关闭正在使用它的编辑器后重试。"
+        }
+    }
+}
+
 function Find-InstallDirs {
     $found = New-Object System.Collections.Generic.List[string]
 
@@ -597,8 +621,8 @@ function Get-RunningState {
             try { $procPath = [string]$proc.Path } catch { }
 
             # 只统计目标目录树内的进程：多个安装目录共存时不能互相冒名，
-            # 系统里无关的 node.exe 或权限受限无法读取路径的沙箱进程也不该被算作当前目录的进程。
-            if (-not $procPath -or -not (Test-PathInside $procPath $BaseDir)) { continue }
+            # 系统里无关的 node.exe 也不该被算作后端子进程。
+            if ($procPath -and -not (Test-PathInside $procPath $BaseDir)) { continue }
 
             if ($isHost) { $result.HostRunning++ } else { $result.ChildRunning++ }
 
@@ -1134,6 +1158,8 @@ function Invoke-Repair {
             return $false
         }
     }
+    # 可选文件（ACP 启动包装器）：缺失时顺带补回，失败只告警
+    Copy-OptionalPatchFiles -SrcDir $SrcDir -BaseDir $BaseDir -Variant $Variant
 
     $configDst = Join-Path $BaseDir "config.json"
     $configSrc = Join-Path $SrcDir "config.json"
@@ -1344,6 +1370,8 @@ function Invoke-Setup {
             return $false
         }
     }
+    # 可选文件（ACP 启动包装器）：随 CLI 补丁一起部署，失败只告警
+    Copy-OptionalPatchFiles -SrcDir $SrcDir -BaseDir $BaseDir -Variant $Variant
 
     $configDst = Join-Path $BaseDir "config.json"
     if ((Test-FileExists $configDst) -and -not $OverwriteConfig) {

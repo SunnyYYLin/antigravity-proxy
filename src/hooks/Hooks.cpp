@@ -36,6 +36,8 @@
 #include "ProcessName.hpp"
 
 using Hooks::GetCreateProcessTargetBaseNameA;
+using Hooks::IsAcpServerChainChildName;
+using Hooks::IsAgyAcpServerProcessName;
 using Hooks::IsLanguageServerProcessName;
 using Hooks::ToLowerAsciiCopy;
 
@@ -258,6 +260,8 @@ static std::once_flag g_runtimeConfigLogOnce;
 // 新版 Antigravity 可能把部分对话链路下沉到 language_server 派生的 node.exe；
 // 这里仅对该组合做一次兼容提示，避免 filtered 模式下静默漏注入。
 static std::once_flag g_languageServerNodeCompatLogOnce;
+// ACP 服务端进程链兼容注入的提示只记录一次（Issue #164）
+static std::once_flag g_acpServerCompatLogOnce;
 // IP/日志联合诊断只需要在主 Antigravity 进程里启动一次。
 static std::once_flag g_agentIpDiagnosisThreadOnce;
 
@@ -804,6 +808,26 @@ static void LogLanguageServerNodeCompatInjectOnce(const std::string& childProces
     });
 }
 
+// 兼容说明（Issue #164）：ACP Registry 分发的 agy_acp_server.exe 由 JetBrains/Zed 等编辑器直接拉起，
+// 父进程不是 Antigravity，旧配置的 target_processes 也不包含它的子进程名。
+// 当前进程已被注入（通常由 agy-acp-proxy.exe 包装器完成）时，只对
+// `agy_acp_server.exe -> agy_acp_server.exe / localharness_external.exe` 这条链路做窄范围自动继承注入。
+static bool ShouldAutoInjectAcpServerChild(const Core::Config& config, const std::string& childProcessName) {
+    if (!config.childInjection) return false;
+    if (ToLowerAsciiCopy(config.childInjectionMode) == "inherit") return false;
+    if (!IsAcpServerChainChildName(childProcessName)) return false;
+    return IsAgyAcpServerProcessName(GetCurrentProcessBaseName());
+}
+
+static void LogAcpServerCompatInjectOnce(const std::string& childProcessName) {
+    std::call_once(g_acpServerCompatLogOnce, [&childProcessName]() {
+        Core::Logger::Warn(
+            "[兼容/ACP] agy_acp_server.exe 派生了关键子进程 " + childProcessName +
+            "；filtered 模式下将自动继承注入（Python 主体与 localharness 引擎都需要走代理）。"
+            " 如需关闭该行为，请将对应进程名加入 child_injection_exclude。");
+    });
+}
+
 // 统一 socket 类型判定入口：只读取一次 SO_TYPE，避免热路径重复 getsockopt
 // 兼容性策略：读取失败时仍按 SOCK_STREAM 处理（保持历史行为，降低误判风险）
 static int GetSocketTypeForProxyDecision(SOCKET s, bool* outKnown = nullptr) {
@@ -1088,6 +1112,21 @@ static bool ShouldLogUdpProxyFail() {
         Core::Logger::Warn("UDP 代理失败日志过多，后续将仅在 [调试] 级别输出（避免 QUIC 重试导致日志/性能问题）");
     }
     return Core::Logger::IsEnabled(Core::LogLevel::Debug);
+}
+
+// UDP 有效策略为 block 时的放行例外（Issue #169）：
+// loopback、UDP/53，以及命中 direct 路由规则的目标（含 use_default_private 内置的局域网/保留网段）。
+// 意图：block 只阻止 UDP 走公网，局域网 P2P（如 WebRTC host 候选）应与 TCP 一样直连。
+// 仅“命中规则且动作为 direct”才放行；未命中时的 default_action 不参与，避免 default_action=direct 让 block 失效。
+static bool IsUdpBlockExempt(const Core::Config& config, const sockaddr* dst, bool hasPort, uint16_t dstPort) {
+    if (!dst) return false;
+    if (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53)) return true;
+
+    std::string ip;
+    bool isV6 = false;
+    if (!SockaddrToIp(dst, &ip, &isV6)) return false;
+    std::string action;
+    return config.rules.MatchRouting("", ip, isV6, dstPort, "udp", &action, nullptr) && action == "direct";
 }
 
 // connect/ConnectEx 属于高频热路径，路由日志默认做限流，避免 Info 级别大量刷盘
@@ -1650,8 +1689,23 @@ static bool EnsureUdpProxyReady(
         const int err = WSAGetLastError();
         // 并发场景下可能已被其它线程先 connect，WSAEISCONN 视为成功
         if (err != WSAEISCONN) {
-            Core::Logger::Error("UDP 代理: connect relay 失败, sock=" + std::to_string((unsigned long long)udpSock) +
-                                ", WSA错误码=" + std::to_string(err));
+            // Issue #169：失败会随每个 UDP 包重复出现，改为限流输出；
+            // 同时打印 socket 本地绑定地址与 relay 地址，用于确认“已绑定到网卡 IP 的 socket 无法连接本机 relay”（10049）
+            if (ShouldLogUdpProxyFail()) {
+                sockaddr_storage local{};
+                int localLen = (int)sizeof(local);
+                const std::string localStr = (getsockname(udpSock, (sockaddr*)&local, &localLen) == 0)
+                    ? SockaddrToString((sockaddr*)&local) : std::string();
+                const std::string relayStr = SockaddrToString((sockaddr*)&relayForSock);
+                Core::Logger::Error("UDP 代理: connect relay 失败, sock=" + std::to_string((unsigned long long)udpSock) +
+                                    ", local=" + (localStr.empty() ? std::string("(未知)") : localStr) +
+                                    ", relay=" + (relayStr.empty() ? std::string("(未知)") : relayStr) +
+                                    ", WSA错误码=" + std::to_string(err) +
+                                    (err == WSAEADDRNOTAVAIL
+                                         ? "（socket 可能已绑定到非回环网卡地址，无法连接本机 relay；将按 udp_fallback=" +
+                                               config.rules.udp_fallback + " 处理）"
+                                         : std::string()));
+            }
             WSASetLastError(err);
             return false;
         }
@@ -2505,7 +2559,8 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
                 if (udpAction == Core::UdpAction::Block) {
                     uint16_t dstPort = 0;
                     const bool hasPort = TryGetSockaddrPort(name, &dstPort);
-                    const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
+                    // 例外判断统一收敛到 IsUdpBlockExempt（loopback / UDP53 / 局域网等 direct 路由规则）
+                    const bool allowUdp = IsUdpBlockExempt(config, name, hasPort, dstPort);
                     if (!allowUdp) {
                         const int err = WSAEACCES;
                         if (ShouldLogUdpBlock()) {
@@ -3350,7 +3405,8 @@ BOOL PASCAL DetourConnectEx(
                 if (udpAction == Core::UdpAction::Block) {
                     uint16_t dstPort = 0;
                     const bool hasPort = TryGetSockaddrPort(name, &dstPort);
-                    const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
+                    // 例外判断统一收敛到 IsUdpBlockExempt（loopback / UDP53 / 局域网等 direct 路由规则）
+                    const bool allowUdp = IsUdpBlockExempt(config, name, hasPort, dstPort);
                     if (!allowUdp) {
                         const int err = WSAEACCES;
                         if (ShouldLogUdpBlock()) {
@@ -3820,7 +3876,10 @@ BOOL WINAPI DetourCreateProcessW(
         
         const bool excluded = config.IsChildInjectionExcluded(appName);
         const bool compatInject = (!excluded) && ShouldAutoInjectLanguageServerNodeChild(config, appName);
-        const bool shouldInject = (!excluded) && (config.childInjectionMode == "inherit" || config.ShouldInject(appName) || compatInject);
+        // Issue #164：ACP 服务端进程链（agy_acp_server → Python 主体 / localharness 引擎）窄范围继承注入
+        const bool acpCompatInject = (!excluded) && ShouldAutoInjectAcpServerChild(config, appName);
+        const bool shouldInject = (!excluded) &&
+            (config.childInjectionMode == "inherit" || config.ShouldInject(appName) || compatInject || acpCompatInject);
 
         // 检查是否需要注入子进程（受 child_injection_mode/排除列表影响）
         if (!shouldInject) {
@@ -3852,6 +3911,9 @@ BOOL WINAPI DetourCreateProcessW(
         } else {
             if (compatInject) {
                 LogLanguageServerNodeCompatInjectOnce(appName);
+            }
+            if (acpCompatInject) {
+                LogAcpServerCompatInjectOnce(appName);
             }
             Core::Logger::Info("拦截到进程创建，准备注入 DLL: " + diagnosticContext);
             
@@ -3929,7 +3991,10 @@ BOOL WINAPI DetourCreateProcessA(
         
         const bool excluded = config.IsChildInjectionExcluded(appName);
         const bool compatInject = (!excluded) && ShouldAutoInjectLanguageServerNodeChild(config, appName);
-        const bool shouldInject = (!excluded) && (config.childInjectionMode == "inherit" || config.ShouldInject(appName) || compatInject);
+        // Issue #164：ACP 服务端进程链（agy_acp_server → Python 主体 / localharness 引擎）窄范围继承注入
+        const bool acpCompatInject = (!excluded) && ShouldAutoInjectAcpServerChild(config, appName);
+        const bool shouldInject = (!excluded) &&
+            (config.childInjectionMode == "inherit" || config.ShouldInject(appName) || compatInject || acpCompatInject);
 
         // 检查是否需要注入子进程（受 child_injection_mode/排除列表影响）
         if (!shouldInject) {
@@ -3961,6 +4026,9 @@ BOOL WINAPI DetourCreateProcessA(
         } else {
             if (compatInject) {
                 LogLanguageServerNodeCompatInjectOnce(appName);
+            }
+            if (acpCompatInject) {
+                LogAcpServerCompatInjectOnce(appName);
             }
             Core::Logger::Info("拦截到进程创建，准备注入 DLL: " + diagnosticContext);
             
@@ -4510,7 +4578,8 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
             if (udpAction == Core::UdpAction::Block) {
                 uint16_t dstPort = 0;
                 const bool hasPort = TryGetSockaddrPort(dst, &dstPort);
-                const bool allowUdp = dst && (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53));
+                // 例外判断统一收敛到 IsUdpBlockExempt（loopback / UDP53 / 局域网等 direct 路由规则）
+                const bool allowUdp = IsUdpBlockExempt(config, dst, hasPort, dstPort);
                 if (!allowUdp) {
                     const int err = WSAEACCES;
                     if (ShouldLogUdpBlock()) {
@@ -4640,7 +4709,8 @@ int WSAAPI DetourWSASendTo(
             if (udpAction == Core::UdpAction::Block) {
                 uint16_t dstPort = 0;
                 const bool hasPort = TryGetSockaddrPort(dst, &dstPort);
-                const bool allowUdp = dst && (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53));
+                // 例外判断统一收敛到 IsUdpBlockExempt（loopback / UDP53 / 局域网等 direct 路由规则）
+                const bool allowUdp = IsUdpBlockExempt(config, dst, hasPort, dstPort);
                 if (!allowUdp) {
                     const int err = WSAEACCES;
                     if (lpNumberOfBytesSent) {
